@@ -1,0 +1,13 @@
+# 构建产物 - 不上传，由构建脚本生成
+build/
+Output/
+
+# 二进制分发包 - 需要自行下载
+dist/
+
+# Rust 编译产物
+ewan-openclaw-launcher/target/
+
+# 其他
+*.exe
+*.log

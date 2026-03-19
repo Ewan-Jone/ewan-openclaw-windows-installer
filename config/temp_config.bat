@@ -1,0 +1,7 @@
+@echo off
+set BASE_URL=
+set API_KEY=
+set MODEL_NAME=
+set API_PROTOCOL=openai
+set WEBCHAT_PORT=17789
+set WORKSPACE_PATH=

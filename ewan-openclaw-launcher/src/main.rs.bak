@@ -1,0 +1,581 @@
+// Windows GUI 程序：不显示控制台窗口
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
+//! main.rs
+//! OpenClaw Launcher — Windows 系统托盘托管程序
+//!
+//! 程序入口，负责协调各模块完成：
+//! 1. 初始化日志
+//! 2. 加载配置
+//! 3. 检查 WSL 发行版
+//! 4. 首次引导
+//! 5. 启动 Gateway
+//! 6. 创建托盘图标
+//! 7. 健康检测循环
+//! 8. 处理托盘菜单事件
+
+mod autostart;
+mod config;
+mod health;
+mod onboarding;
+mod tray;
+mod wsl;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use anyhow::{Context, Result};
+use tray_icon::menu::MenuEvent;
+use tracing::{error, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+
+use crate::config::Config;
+use crate::health::{GatewayStatus, HealthChecker};
+use crate::onboarding::OnboardingServer;
+use crate::tray::{handle_menu_event, TrayAction, TrayManager};
+
+/// 日志目录：{exe所在目录}\logs
+pub fn log_dir() -> std::path::PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    exe_dir.join("logs")
+}
+
+fn main() -> Result<()> {
+    // ── 1. 初始化日志（同时输出到文件和 stderr）─────────────────────────────
+    let log_directory = log_dir();
+    std::fs::create_dir_all(&log_directory).ok();
+
+    // 文件日志：launcher.log（非阻塞写入）
+    let file_appender = tracing_appender::rolling::never(&log_directory, "launcher.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // 同时输出到文件和 stderr（debug 时方便看）
+    use tracing_subscriber::prelude::*;
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false);
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(false);
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .with(file_layer)
+        .with(stderr_layer)
+        .init();
+
+    // _guard 必须持有到 main 结束，否则日志 worker 线程提前退出
+    // 用 Box::leak 让它存活整个进程生命周期
+    let _log_guard: &'static WorkerGuard = Box::leak(Box::new(_guard));
+
+    info!("OpenClaw Launcher starting...");
+    info!("Log directory: {}", log_directory.display());
+
+    // ── 2. 加载配置 ──────────────────────────────────────────────────────────
+    let mut config = Config::load().unwrap_or_else(|e| {
+        warn!("Failed to load config, using defaults: {}", e);
+        Config::default()
+    });
+
+    info!(
+        "Config loaded: distro={}, port={}, first_run={}",
+        config.wsl_distro, config.gateway_port, config.first_run
+    );
+
+    // ── 3. 检查 WSL 发行版 ───────────────────────────────────────────────────
+    if !wsl::is_distro_installed(&config.wsl_distro) {
+        let msg = format!(
+            "未找到 OpenClaw WSL 发行版「{}」。\n\n\
+            请重新安装 OpenClaw 或联系技术支持。",
+            config.wsl_distro
+        );
+        onboarding::show_error("AI 助手 - 安装错误", &msg);
+        return Ok(());
+    }
+
+    // ── 4. 启动常驻配置页服务 ────────────────────────────────────────────────
+    let onboarding_server = OnboardingServer::start()
+        .unwrap_or_else(|e| {
+            warn!("Onboarding server failed to start: {}", e);
+            // 兜底：返回一个无效的服务（不影响主流程）
+            panic!("Cannot start onboarding server: {}", e);
+        });
+
+    // 首次运行：自动打开配置页，等待用户完成配置
+    if config.first_run {
+        info!("First run: opening onboarding page");
+        onboarding_server.open();
+
+        // 阻塞等待用户完成配置（最多5分钟）
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(300);
+        loop {
+            if start.elapsed() > timeout {
+                warn!("Onboarding timed out, skipping");
+                break;
+            }
+            if let Some(oc) = onboarding_server.try_recv() {
+                info!("Onboarding complete, applying config...");
+                apply_onboarding_config(&config.wsl_distro, &oc);
+                config.first_run = false;
+                config.gateway_port = oc.webchat_port;
+                config.save().unwrap_or_else(|e| warn!("Failed to save config: {}", e));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    // ── 5. 异步运行时（健康检测使用 tokio）──────────────────────────────────
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("创建 tokio 运行时失败")?;
+
+    // ── 6. 后台启动 Gateway ──────────────────────────────────────────────────
+    let distro = config.wsl_distro.clone();
+    let gateway_port = config.gateway_port;
+    std::thread::spawn(move || {
+        info!("Background thread: starting gateway...");
+        if let Err(e) = wsl::start_gateway(&distro, gateway_port) {
+            error!("Gateway start failed: {}", e);
+        }
+    });
+
+    // ── 7. 创建托盘图标 ──────────────────────────────────────────────────────
+    let autostart_enabled = autostart::is_autostart_enabled();
+    let mut tray = TrayManager::new(autostart_enabled)
+        .context("创建托盘图标失败")?;
+
+    // 共享状态：健康检测线程 → 主线程
+    let shared_status: Arc<Mutex<GatewayStatus>> =
+        Arc::new(Mutex::new(GatewayStatus::Starting));
+    let status_for_health = shared_status.clone();
+
+    // ── 8. 后台健康检测循环 ──────────────────────────────────────────────────
+    let gateway_url = config.gateway_url();
+    let gateway_url_for_open = gateway_url.clone();
+    let distro_for_health = config.wsl_distro.clone();
+
+    rt.spawn(async move {
+        let mut checker = HealthChecker::new(gateway_url.clone());
+
+        // 先等 Gateway 就绪（最多 60 秒），就绪后打开浏览器
+        if checker.wait_until_ready(60).await {
+            info!("Gateway ready, opening browser");
+            open_browser(&gateway_url);
+
+            // 更新共享状态
+            if let Ok(mut s) = status_for_health.lock() {
+                *s = GatewayStatus::Running;
+            }
+        } else {
+            warn!("Gateway not ready within 60s");
+            if let Ok(mut s) = status_for_health.lock() {
+                *s = GatewayStatus::Stopped;
+            }
+        }
+
+        // 健康检测循环（每 30 秒）
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let new_status = checker.check(&distro_for_health).await;
+            if let Ok(mut s) = status_for_health.lock() {
+                *s = new_status;
+            }
+        }
+    });
+
+    // ── 9. 主事件循环（处理托盘菜单点击 + Windows 消息泵）──────────────────
+    // tray-icon 在 Windows 上依赖消息泵，必须在主线程跑 GetMessage 循环
+    // 否则右键菜单无法弹出/响应
+    info!("Entering main event loop");
+
+    let menu_channel = MenuEvent::receiver();
+    let mut last_status = GatewayStatus::Starting;
+
+    loop {
+        // 抽干 Windows 消息队列（让托盘右键菜单能弹出）
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                PeekMessageW, TranslateMessage, DispatchMessageW, PM_REMOVE, MSG,
+            };
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        // 轮询菜单事件（非阻塞）
+        if let Ok(event) = menu_channel.try_recv() {
+            match handle_menu_event(event) {
+                TrayAction::Open => {
+                    info!("User action: open");
+                    open_browser(&gateway_url_for_open);
+                }
+
+                TrayAction::Settings => {
+                    info!("User action: settings");
+                    onboarding_server.open();
+                }
+
+                TrayAction::Restart => {
+                    info!("User action: restart");
+                    let distro = config.wsl_distro.clone();
+                    let port = config.gateway_port;
+                    std::thread::spawn(move || {
+                        if let Err(e) = wsl::stop_gateway(&distro) {
+                            warn!("Failed to stop gateway: {}", e);
+                        }
+                        // 等待 gateway 真正停止，而不是硬编码 sleep
+                        if !wsl::wait_gateway_stopped(&distro, 10) {
+                            warn!("Gateway did not stop, proceeding anyway");
+                        }
+                        if let Err(e) = wsl::start_gateway(&distro, port) {
+                            error!("Failed to restart gateway: {}", e);
+                        }
+                    });
+                }
+
+                TrayAction::ToggleAutostart => {
+                    let currently_enabled = autostart::is_autostart_enabled();
+                    if currently_enabled {
+                        info!("User disabled autostart");
+                        autostart::disable_autostart()
+                            .unwrap_or_else(|e| warn!("Failed to disable autostart: {}", e));
+                        tray.update_autostart_item(false);
+                    } else {
+                        info!("User enabled autostart");
+                        autostart::enable_autostart()
+                            .unwrap_or_else(|e| warn!("Failed to enable autostart: {}", e));
+                        tray.update_autostart_item(true);
+                    }
+                }
+
+                TrayAction::ExportLogs => {
+                    info!("User action: export logs");
+                    let distro = config.wsl_distro.clone();
+                    let log_dir_path = log_dir();
+                    std::thread::spawn(move || {
+                        export_logs_to_desktop(&distro, &log_dir_path);
+                    });
+                }
+
+                TrayAction::Quit => {
+                    info!("User action: quit");
+                    // 退出前停止 Gateway
+                    let distro = config.wsl_distro.clone();
+                    let _ = wsl::stop_gateway(&distro);
+                    break;
+                }
+
+                TrayAction::None => {}
+            }
+        }
+
+        // 轮询配置页提交（用户在"设置"页保存配置后触发）
+        if let Some(oc) = onboarding_server.try_recv() {
+            info!("New config submitted: base_url={}, model={}, port={}, protocol={}",
+                oc.base_url, oc.model_name, oc.webchat_port, oc.api_protocol);
+            let distro = config.wsl_distro.clone();
+            std::thread::spawn(move || {
+                apply_onboarding_config(&distro, &oc);
+            });
+        }
+
+        // 同步健康状态到托盘图标
+        if let Ok(current_status) = shared_status.lock() {
+            if *current_status != last_status {
+                last_status = current_status.clone();
+                tray.update_status(&last_status)
+                    .unwrap_or_else(|e| warn!("Failed to update tray status: {}", e));
+            }
+        }
+
+        // 避免 CPU 空转
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    info!("OpenClaw Launcher exiting");
+    Ok(())
+}
+
+/// 把引导页填写的配置写入 WSL 里的 OpenClaw
+fn apply_onboarding_config(distro: &str, oc: &onboarding::OnboardingConfig) {
+    use std::os::windows::process::CommandExt;
+
+    // 构建 bash 脚本，依次设置各配置项
+    let mut cmds: Vec<String> = Vec::new();
+
+    // ── 1. Gateway 基础配置（首次安装必须初始化）────────────────────────────
+    // 允许局域网 IP 访问（非 HTTPS/localhost 环境下的 device identity 绕过）
+    cmds.push("openclaw config set gateway.mode local".to_string());
+    cmds.push("openclaw config set gateway.controlUi.allowInsecureAuth true".to_string());
+    cmds.push("openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true".to_string());
+
+    // ── 2. Gateway 认证（无认证，仅供个人本机使用）────────────────────────
+    cmds.push("openclaw config set gateway.auth.mode none".to_string());
+
+    // ── 3. WebChat 端口 ──────────────────────────────────────────────────────
+    let port = if oc.webchat_port != 0 { oc.webchat_port } else { 17789 };
+    cmds.push(format!("openclaw config set gateway.port {}", port));
+
+    // ── 4. 模型 Provider（整块 JSON 写入，格式正确）──────────────────────────
+    if !oc.base_url.is_empty() && !oc.api_key.is_empty() && !oc.model_name.is_empty() {
+        let protocol = if oc.api_protocol.is_empty() { "openai" } else { &oc.api_protocol };
+        // JSON 中的字符串字段需要转义单引号
+        let base_url   = oc.base_url.replace('\'', "'\\''").replace('"', "\\\"");
+        let api_key    = oc.api_key.replace('\'', "'\\''").replace('"', "\\\"");
+        let model_id   = oc.model_name.replace('\'', "'\\''").replace('"', "\\\"");
+        let model_name = oc.model_name.replace('\'', "'\\''").replace('"', "\\\"");
+
+        // 写入 provider 配置（整块 JSON）
+        let provider_json = format!(
+            r#"{{"baseUrl":"{base_url}","apiKey":"{api_key}","api":"{protocol}","models":[{{"id":"{model_id}","name":"{model_name}"}}]}}"#,
+            base_url = base_url,
+            api_key = api_key,
+            protocol = protocol,
+            model_id = model_id,
+            model_name = model_name,
+        );
+        cmds.push(format!(
+            "openclaw config set 'models.providers.custom' '{}' --strict-json",
+            provider_json
+        ));
+        // 设置默认使用的模型
+        cmds.push(format!(
+            "openclaw config set 'agents.defaults.model.primary' 'custom/{}'",
+            model_id
+        ));
+    }
+
+    // 先找到 openclaw 可执行文件的绝对路径，避免 bash -lc 的 PATH 问题
+    let oc_bin = wsl::find_openclaw_bin(distro).unwrap_or_else(|| "openclaw".to_string());
+    info!("openclaw binary path: {}", oc_bin);
+
+    // Replace `openclaw ` with absolute path
+    let script_with_path = cmds
+        .iter()
+        .map(|c| c.replacen("openclaw ", &format!("{} ", oc_bin), 1))
+        .collect::<Vec<_>>()
+        .join(" && ");
+
+    // Wrap script to capture inner bash exit code via sentinel output.
+    // We cannot rely on the wsl.exe process exit code because WSL may return
+    // non-zero due to systemd user session failures even when bash succeeds.
+    let wrapped = format!("{} ; echo __OPENCLAW_EXIT__:$?", script_with_path);
+
+    info!("Applying OpenClaw config...");
+
+    let output = std::process::Command::new("wsl")
+        .args(["-d", distro, "--", "bash", "-lc", &wrapped])
+        .creation_flags(0x0800_0000)
+        .output();
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // Parse inner exit code from sentinel
+            let inner_exit = stdout
+                .lines()
+                .find_map(|l| l.strip_prefix("__OPENCLAW_EXIT__:"))
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .unwrap_or(-1);
+            if inner_exit == 0 {
+                info!("OpenClaw config applied successfully");
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                warn!("OpenClaw config apply failed, inner exit: {}", inner_exit);
+                warn!("stdout: {}", stdout.trim());
+                warn!("stderr: {}", stderr.trim());
+            }
+        }
+        Err(e) => {
+            warn!("Failed to execute wsl command: {}", e);
+        }
+    }
+
+    // 处理 workspace 路径挂载
+    if !oc.workspace_path.is_empty() {
+        apply_workspace_mount(distro, &oc.workspace_path);
+    }
+
+    // 重启 Gateway 让所有配置生效
+    info!("Restarting gateway to apply config...");
+    if let Err(e) = wsl::stop_gateway(distro) {
+        warn!("Failed to stop gateway: {}", e);
+    }
+    // 等待 gateway 真正停止，而不是硬编码 sleep
+    if !wsl::wait_gateway_stopped(distro, 10) {
+        warn!("Gateway did not stop, proceeding anyway");
+    }
+    if let Err(e) = wsl::start_gateway(distro, oc.webchat_port) {
+        warn!("Failed to restart gateway: {}", e);
+    }
+}
+
+/// 把 Windows workspace 路径挂载到 WSL 的 /root/.openclaw/workspace
+///
+/// 转换规则：D:\MyWorkspace → /mnt/d/MyWorkspace
+/// 写入 /etc/fstab（去重），立即 mount -a 生效
+fn apply_workspace_mount(distro: &str, win_path: &str) {
+    use std::os::windows::process::CommandExt;
+
+    // 把 Windows 路径转成 drvfs 格式
+    // 例：D:\My Workspace → /mnt/d/My Workspace
+    let linux_path = windows_path_to_linux(win_path);
+    if linux_path.is_empty() {
+        warn!("Invalid Windows path: {}", win_path);
+        return;
+    }
+
+    info!("Configuring workspace mount: {} -> /root/.openclaw/workspace", linux_path);
+
+    let fstab_line = format!(
+        "{} /root/.openclaw/workspace drvfs defaults 0 0",
+        linux_path
+    );
+
+    // 写入 fstab（先删除旧的 workspace 挂载行，再追加新的）
+    // 同时创建挂载点并立即 mount
+    let script = format!(
+        r#"
+        mkdir -p /root/.openclaw/workspace &&
+        sed -i '/\/root\/.openclaw\/workspace/d' /etc/fstab &&
+        echo '{}' >> /etc/fstab &&
+        mount /root/.openclaw/workspace 2>/dev/null || true
+        "#,
+        fstab_line
+    );
+
+    let status = std::process::Command::new("wsl")
+        .args(["-d", distro, "--", "bash", "-lc", script.trim()])
+        .creation_flags(0x0800_0000)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => info!("Workspace mount configured"),
+        Ok(s) => warn!("Workspace mount failed, exit code: {:?}", s.code()),
+        Err(e) => warn!("Failed to execute mount command: {}", e),
+    }
+}
+
+/// 将 Windows 路径转换为 WSL drvfs Linux 路径
+/// D:\Foo\Bar  →  /mnt/d/Foo/Bar
+/// C:\Users\x  →  /mnt/c/Users/x
+fn windows_path_to_linux(win_path: &str) -> String {
+    let path = win_path.trim().replace('\\', "/");
+    // 检查是否以盘符开头（如 D:/、C:/）
+    if path.len() >= 3 && path.chars().nth(1) == Some(':') {
+        let drive = path.chars().next().unwrap().to_lowercase().to_string();
+        let rest = &path[3..]; // 跳过 "D:/"
+        format!("/mnt/{}/{}", drive, rest)
+    } else {
+        String::new()
+    }
+}
+
+/// 用系统默认浏览器打开指定 URL
+fn open_browser(url: &str) {
+    info!("Opening browser: {}", url);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn();
+    }
+
+    #[cfg(not(windows))]
+    {
+        // 开发调试用（Linux/macOS）
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+/// 导出所有日志到桌面的 openclaw-logs 文件夹
+///
+/// 收集：
+///   1. Launcher 日志：%APPDATA%\OpenClaw\logs\launcher.log
+///   2. WSL 里的 OpenClaw Gateway 日志：~/.openclaw/logs/
+///   3. 安装日志（如果存在）：%USERPROFILE%\Desktop\openclaw-install.log
+fn export_logs_to_desktop(distro: &str, launcher_log_dir: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+
+    // 目标目录：桌面\openclaw-logs\
+    let desktop = std::env::var("USERPROFILE")
+        .map(|p| std::path::PathBuf::from(p).join("Desktop"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dest = desktop.join("openclaw-logs");
+    if let Err(e) = std::fs::create_dir_all(&dest) {
+        warn!("Failed to create log export dir: {}", e);
+        return;
+    }
+
+    info!("Exporting logs to: {}", dest.display());
+
+    // 1. 复制 Launcher 日志
+    let launcher_log = launcher_log_dir.join("launcher.log");
+    if launcher_log.exists() {
+        let dst = dest.join("launcher.log");
+        match std::fs::copy(&launcher_log, &dst) {
+            Ok(_) => info!("Copied launcher log: {}", dst.display()),
+            Err(e) => warn!("Failed to copy launcher log: {}", e),
+        }
+    }
+
+    // 2. 复制安装日志（桌面根目录）
+    let install_log = desktop.join("openclaw-install.log");
+    if install_log.exists() {
+        let dst = dest.join("openclaw-install.log");
+        match std::fs::copy(&install_log, &dst) {
+            Ok(_) => info!("Copied install log: {}", dst.display()),
+            Err(e) => warn!("Failed to copy install log: {}", e),
+        }
+    }
+
+    // 3. 复制 Gateway 日志（现已直接写在安装目录 logs\ 下）
+    let app_logs = launcher_log_dir; // launcher_log_dir 即 {app}\logs
+    if app_logs.exists() {
+        for entry in std::fs::read_dir(app_logs).into_iter().flatten().flatten() {
+            let src = entry.path();
+            if src.extension().and_then(|e| e.to_str()) == Some("log") {
+                if let Some(fname) = src.file_name() {
+                    let dst = dest.join(fname);
+                    match std::fs::copy(&src, &dst) {
+                        Ok(_) => info!("Copied log: {}", dst.display()),
+                        Err(e) => warn!("Failed to copy log {:?}: {}", src, e),
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. 弹窗告知用户
+    info!("Log export complete: {}", dest.display());
+    let msg = format!(
+        "日志已导出到桌面的 openclaw-logs 文件夹：\n\n{}\n\n包含：\n  · launcher.log（启动器日志）\n  · gateway/（AI 助手服务日志）\n  · openclaw-install.log（安装日志）",
+        dest.display()
+    );
+
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONINFORMATION};
+        let title: Vec<u16> = "OpenClaw 日志导出".encode_utf16().chain(std::iter::once(0)).collect();
+        let text:  Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+        MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+    }
+}

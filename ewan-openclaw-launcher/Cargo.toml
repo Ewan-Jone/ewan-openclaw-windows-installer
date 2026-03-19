@@ -1,0 +1,61 @@
+[package]
+name = "ewan-openclaw-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "Ewan OpenClaw AI 助手 Windows 系统托盘启动器"
+authors = ["Ewan Team"]
+license = "MIT"
+repository = "https://github.com/ewan/ewan-openclaw-launcher"
+
+# Windows GUI 程序，不显示控制台黑框
+[[bin]]
+name = "ewan-openclaw-launcher"
+path = "src/main.rs"
+
+# ── 通用依赖 ──────────────────────────────────────────────────────────────
+[dependencies]
+
+# 系统托盘图标 + 菜单（跨平台，Windows 后端使用原生 Shell_NotifyIcon）
+tray-icon = "0.19"
+
+# 异步运行时（多线程）
+tokio = { version = "1", features = ["full"] }
+
+# HTTP 健康检测（rustls 避免 OpenSSL 依赖）
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# 配置文件序列化/反序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 错误处理
+anyhow = "1"
+
+# 结构化日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# PNG 解码（for tray icon）
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+
+# ── Windows 专用依赖 ──────────────────────────────────────────────────────
+[target.'cfg(windows)'.dependencies]
+
+# Windows 注册表操作（开机自启）
+winreg = "0.52"
+
+# Windows 高级 API 绑定（MessageBox、PCWSTR 等）
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+] }
+
+# ── 编译优化（release 构建）──────────────────────────────────────────────
+[profile.release]
+opt-level = "z"      # 最小体积
+lto = true           # 链接时优化
+strip = true         # 去除调试符号
+codegen-units = 1    # 单编译单元

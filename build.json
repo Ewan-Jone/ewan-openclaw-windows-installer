@@ -1,0 +1,31 @@
+{
+  "_comment": "构建配置文件 - 指定各组件的下载地址或本地路径",
+  "_note": "支持 http/https URL 或本地绝对路径，本地路径优先",
+
+  "components": {
+    "rootfs": {
+      "_comment": "OpenClaw Linux 根文件系统（Ubuntu 24.04 + Node22 + OpenClaw）",
+      "url": "",
+      "local": "",
+      "dest": "build/openclaw-rootfs.tar.gz"
+    },
+    "wsl": {
+      "_comment": "WSL 本体安装包（从微软官方下载）",
+      "url": "https://github.com/microsoft/WSL/releases/download/2.6.3/wsl.2.6.3.0.x64.msi",
+      "local": "",
+      "dest": "dist/wsl.x64.msi"
+    },
+    "wsl_kernel": {
+      "_comment": "WSL2 内核更新包（从微软官方下载）",
+      "url": "https://wslstorestorage.blob.core.windows.net/wslblob/wsl_update_x64.msi",
+      "local": "",
+      "dest": "dist/wsl_update_x64.msi"
+    },
+    "webview2": {
+      "_comment": "Microsoft Edge WebView2 常绿 Bootstrapper（~1.7MB，已安装时自动跳过）",
+      "url": "https://go.microsoft.com/fwlink/p/?LinkId=2124703",
+      "local": "",
+      "dest": "dist/MicrosoftEdgeWebview2Setup.exe"
+    }
+  }
+}
